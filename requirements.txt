@@ -1,4 +1,1 @@
-requests
-pandas
-numpy
-
+# Common Python packages (for local dev)

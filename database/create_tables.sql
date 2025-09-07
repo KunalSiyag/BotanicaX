@@ -1,0 +1,2 @@
+-- SQL schema scripts for Azure SQL Database
+-- Example: CREATE TABLE Farm (...)
