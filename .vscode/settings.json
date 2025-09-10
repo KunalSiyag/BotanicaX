@@ -1,0 +1,5 @@
+{
+    "python.analysis.extraPaths": [
+        "./BotanicaX-functions/shared_code"
+    ]
+}
