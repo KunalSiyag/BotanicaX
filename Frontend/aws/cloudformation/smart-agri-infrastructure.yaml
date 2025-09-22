@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Smart Agri dApp Backend Infrastructure'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment type
+
+Resources:
+  # DynamoDB Table for Sensor Data
+  SensorDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub SmartAgriSensorData-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: farmerId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: farmerId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt SensorDataTable.Arn
+
+  # Lambda Function for Processing Sensor Data
+  ProcessSensorDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub SmartAgri-ProcessSensorData-${Environment}
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: nodejs18.x
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref SensorDataTable
+          BLOCKCHAIN_RPC_URL: !Sub '{{resolve:secretsmanager:SmartAgri-${Environment}:SecretString:BlockchainRpcUrl}}'
+          CERTIFICATION_MANAGER_ADDRESS: !Sub '{{resolve:secretsmanager:SmartAgri-${Environment}:SecretString:CertificationManagerAddress}}'
+          TRUSTED_FORWARDER_PRIVATE_KEY: !Sub '{{resolve:secretsmanager:SmartAgri-${Environment}:SecretString:TrustedForwarderPrivateKey}}'
+      Code:
+        S3Bucket: !Sub smart-agri-lambda-code-${Environment}
+        S3Key: processSensorData.zip
+
+  # API Gateway for Sensor Data Endpoint
+  SensorDataApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub SmartAgri-SensorData-API-${Environment}
+      Description: API for Smart Agri sensor data processing
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway Resource
+  SensorDataResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SensorDataApi
+      ParentId: !GetAtt SensorDataApi.RootResourceId
+      PathPart: sensor-data
+
+  # API Gateway Method
+  SensorDataMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SensorDataApi
+      ResourceId: !Ref SensorDataResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProcessSensorDataFunction.Arn}/invocations
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: SensorDataMethod
+    Properties:
+      RestApiId: !Ref SensorDataApi
+      StageName: !Ref Environment
+
+  # Lambda Permission for API Gateway
+  LambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProcessSensorDataFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SensorDataApi}/*/${SensorDataMethod.HttpMethod}${SensorDataResource.PathPart}
+
+  # Lambda Function for Periodic Score Updates
+  PeriodicScoreUpdateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub SmartAgri-PeriodicScoreUpdate-${Environment}
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: nodejs18.x
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref SensorDataTable
+          BLOCKCHAIN_RPC_URL: !Sub '{{resolve:secretsmanager:SmartAgri-${Environment}:SecretString:BlockchainRpcUrl}}'
+          CERTIFICATION_MANAGER_ADDRESS: !Sub '{{resolve:secretsmanager:SmartAgri-${Environment}:SecretString:CertificationManagerAddress}}'
+          TRUSTED_FORWARDER_PRIVATE_KEY: !Sub '{{resolve:secretsmanager:SmartAgri-${Environment}:SecretString:TrustedForwarderPrivateKey}}'
+      Code:
+        S3Bucket: !Sub smart-agri-lambda-code-${Environment}
+        S3Key: periodicScoreUpdate.zip
+
+  # EventBridge Rule for Periodic Updates
+  PeriodicUpdateRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub SmartAgri-PeriodicUpdate-${Environment}
+      Description: Trigger periodic updates of sustainability scores
+      ScheduleExpression: rate(6 hours)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PeriodicScoreUpdateFunction.Arn
+          Id: PeriodicScoreUpdateTarget
+
+  # Permission for EventBridge to invoke Lambda
+  PeriodicUpdatePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PeriodicScoreUpdateFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PeriodicUpdateRule.Arn
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL for sensor data
+    Value: !Sub https://${SensorDataApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/sensor-data
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table
+    Value: !Ref SensorDataTable
